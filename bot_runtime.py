@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup, Comment
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
@@ -145,6 +145,25 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"*Solution Details:*\n\n{answer}", parse_mode="Markdown")
 
 
+async def check_user_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip().lower()
+    chat_id = update.effective_chat.id
+    
+    correct_answer_raw = context.bot_data.get(f"{chat_id}_answer", "").strip().lower()
+    
+    if not correct_answer_raw:
+        await update.message.reply_text("I don't have an active puzzle on file for you. Send /puzzle to get one!")
+        return
+    if user_text in correct_answer_raw or correct_answer_raw in user_text:
+        await update.message.reply_text("🎉 *Correct!* Brilliant job!", parse_mode="Markdown")
+    else:
+        keyboard = [[InlineKeyboardButton("Show Solution", callback_data="show_solution")]]
+        await update.message.reply_text(
+            "That's not quite right. Try looking at the hint or try another guess!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
 def main():
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
@@ -163,6 +182,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("puzzle", send_puzzle))
     app.add_handler(CallbackQueryHandler(handle_buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_user_answer))
 
     if webhook_base_url:
         print(f"📡 Webhook Mode Active: Directing traffic to {webhook_base_url}")
