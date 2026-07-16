@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup, Comment
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
@@ -30,16 +30,16 @@ def fetch_live_random_puzzle():
             if isinstance(node, str):
                 return node
             
-            for bold in node.find_all(['strong', 'b']):
+            node_copy = BeautifulSoup(str(node), 'html.parser')
+            for bold in node_copy.find_all(['strong', 'b']):
                 bold.replace_with(f"*{bold.get_text(strip=True)}*")
-            for br in node.find_all('br'):
+            for br in node_copy.find_all('br'):
                 br.replace_with("\n")
                 
-            text = node.get_text()
-            text = text.replace('\xa0', ' ').replace('\r', '')
-            return text
+            text = node_copy.get_text()
+            return text.replace('\xa0', ' ').replace('\r', '')
 
-        # --- 1. QUESTION EXTRACTION ---
+        # --- QUESTION EXTRACTION ---
         q_start = soup.find(string=lambda text: isinstance(text, Comment) and 'Question Start' in text)
         q_end = soup.find(string=lambda text: isinstance(text, Comment) and 'Question End' in text)
         
@@ -48,18 +48,24 @@ def fetch_live_random_puzzle():
             collected_q = []
             next_node = q_start.next_sibling
             while next_node and next_node != q_end:
-                if next_node.name:  # Only parse valid HTML tags, skip raw string newlines
+                if next_node.name:
+                    if next_node.name == 'img' or next_node.find('img'):
+                        print(f"Rejection Trigger: Skipping image puzzle on {date_str}")
+                        return None
                     collected_q.append(clean_node_text(next_node).strip())
                 next_node = next_node.next_sibling
             question_text = "\n".join([q for q in collected_q if q])
 
-        # --- 2. HINT EXTRACTION ---
+        if not question_text:
+            return None
+
+        # --- HINT EXTRACTION ---
         hint_div = soup.find('div', id='hdivans')
         hint_text = "No hint available for this puzzle."
         if hint_div:
             hint_text = clean_node_text(hint_div).replace("Hints", "", 1).strip()
 
-        # --- 3. ANSWER/SOLUTION EXTRACTION ---
+        # --- ANSWER EXTRACTION ---
         s_start = soup.find(string=lambda text: isinstance(text, Comment) and 'Answer Start' in text)
         s_end = soup.find(string=lambda text: isinstance(text, Comment) and 'Answer End' in text)
         
@@ -75,18 +81,17 @@ def fetch_live_random_puzzle():
             raw_ans = "\n".join([s for s in collected_s if s])
             answer_text = raw_ans.strip()
 
-        answer = {
+        return {
             "question": question_text,
             "hint": hint_text,
             "answer": answer_text
         }
-        
-        return answer
 
     except Exception as e:
         print(f"Live scraping error: {e}")
         return None
-    
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Welcome to Shakuntala Puzzle Bot!*\n\n"
@@ -98,9 +103,10 @@ async def send_puzzle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_chat_action("typing")
     
     puzzle = fetch_live_random_puzzle()
-    
-    if not puzzle:
+    retries = 0
+    while not puzzle and retries < 3:
         puzzle = fetch_live_random_puzzle()
+        retries += 1
         
     if not puzzle:
         await update.message.reply_text("Connection timeout gathering puzzle. Please try again!")
@@ -138,20 +144,57 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = context.bot_data.get(f"{chat_id}_answer", "No solution data found.")
         await query.message.reply_text(f"*Solution Details:*\n\n{answer}", parse_mode="Markdown")
 
+
+async def check_user_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip().lower()
+    chat_id = update.effective_chat.id
+    
+    correct_answer_raw = context.bot_data.get(f"{chat_id}_answer", "").strip().lower()
+    
+    if not correct_answer_raw:
+        await update.message.reply_text("I don't have an active puzzle on file for you. Send /puzzle to get one!")
+        return
+    if user_text in correct_answer_raw or correct_answer_raw in user_text:
+        await update.message.reply_text("🎉 *Correct!* Brilliant job!", parse_mode="Markdown")
+    else:
+        keyboard = [[InlineKeyboardButton("Show Solution", callback_data="show_solution")]]
+        await update.message.reply_text(
+            "That's not quite right. Try looking at the hint or try another guess!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
 def main():
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
-        print("Error: TELEGRAM_TOKEN missing from .env file!")
+        print("Error: TELEGRAM_TOKEN missing!")
         return
 
-    print("Launching Live-Extraction Telegram Bot...")
+
+    port = int(os.environ.get("PORT", 8080))
+    
+
+    webhook_base_url = os.getenv("WEBHOOK_URL")
+
+    print("Initializing Webhook Telegram Bot...")
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("puzzle", send_puzzle))
     app.add_handler(CallbackQueryHandler(handle_buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_user_answer))
 
-    app.run_polling()
+    if webhook_base_url:
+        print(f"📡 Webhook Mode Active: Directing traffic to {webhook_base_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=token,               
+            webhook_url=f"{webhook_base_url}/{token}"
+        )
+    else:
+        print("Webhook URL not provided. Falling back to local Polling mode...")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
